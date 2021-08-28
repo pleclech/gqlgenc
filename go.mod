@@ -1,4 +1,4 @@
-module github.com/Yamashou/gqlgenc
+module github.com/pleclech/gqlgenc
 
 go 1.14
 
@@ -14,4 +14,4 @@ require (
 	gopkg.in/yaml.v2 v2.3.0
 )
 
-replace github.com/Yamashou/gqlgenc => github.com/pleclech/gqlgenc
+replace github.com/Yamashou/gqlgenc v0.0.2 => github.com/pleclech/gqlgenc v0.0.4
