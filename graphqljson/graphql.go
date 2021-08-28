@@ -36,6 +36,14 @@ import (
 	"strings"
 )
 
+var (
+	objectBeginToken   = json.Delim('{')
+	objectEndToken     = json.Delim('}')
+	arrayBeginToken    = json.Delim('[')
+	arrayEndToken      = json.Delim(']')
+	mapStringInterface = reflect.TypeOf(map[string]interface{}{})
+)
+
 // Reference: https://blog.gopheracademy.com/advent-2017/custom-json-unmarshaler-for-graphql-client/
 
 // UnmarshalData parses the JSON-encoded GraphQL response data and stores
@@ -89,6 +97,21 @@ func newDecoder(r io.Reader) *Decoder {
 	}
 }
 
+func followPtr(v reflect.Value) reflect.Value {
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	return v
+}
+
+func (d *Decoder) insideObject(tok json.Token) bool {
+	return d.state() == objectBeginToken && tok != objectEndToken
+}
+
+func (d *Decoder) insideArray(tok json.Token) bool {
+	return d.state() == arrayBeginToken && tok != arrayEndToken
+}
+
 // Decode decodes a single JSON value from d.tokenizer into v.
 func (d *Decoder) Decode(v interface{}) error {
 	rv := reflect.ValueOf(v)
@@ -108,8 +131,12 @@ func (d *Decoder) Decode(v interface{}) error {
 func (d *Decoder) decode() error {
 	// The loop invariant is that the top of each d.vs stack
 	// is where we try to unmarshal the next JSON value we see.
+	// var customField reflect.Value
+	// var unmarshalJSON reflect.Value
+loop:
 	for len(d.vs) > 0 {
 		tok, err := d.jsonDecoder.Token()
+
 		if err == io.EOF {
 			return errors.New("unexpected end of JSON input")
 		} else if err != nil {
@@ -118,55 +145,65 @@ func (d *Decoder) decode() error {
 
 		switch {
 		// Are we inside an object and seeing next key (rather than end of object)?
-		case d.state() == '{' && tok != json.Delim('}'):
+		case d.insideObject(tok):
 			key, ok := tok.(string)
 			if !ok {
 				return errors.New("unexpected non-key in JSON input")
 			}
-
 			someFieldExist := false
-			for i := range d.vs {
-				v := d.vs[i][len(d.vs[i])-1]
-				if v.Kind() == reflect.Ptr {
-					v = v.Elem()
-				}
+			continueLoop := false
+			for i, dv := range d.vs {
+				v := followPtr(dv[len(dv)-1])
 				var f reflect.Value
-				if v.Kind() == reflect.Struct {
+				switch v.Kind() {
+				case reflect.Struct:
 					f = fieldByGraphQLName(v, key)
 					if f.IsValid() {
 						someFieldExist = true
+
+						switch f.Kind() {
+						case reflect.Map:
+							f.Set(reflect.MakeMap(mapStringInterface))
+							if err := d.jsonDecoder.Decode(f.Addr().Interface()); err != nil {
+								return fmt.Errorf(": %w", err)
+							}
+							continueLoop = true
+						default:
+							d.vs[i] = append(dv, f)
+						}
 					}
 				}
-				d.vs[i] = append(d.vs[i], f)
 			}
+
 			if !someFieldExist {
 				return fmt.Errorf("struct field for %q doesn't exist in any of %v places to unmarshal", key, len(d.vs))
+			}
+
+			if continueLoop {
+				continue loop
 			}
 
 			// We've just consumed the current token, which was the key.
 			// Read the next token, which should be the value, and let the rest of code process it.
 			tok, err = d.jsonDecoder.Token()
+
 			if err == io.EOF {
 				return errors.New("unexpected end of JSON input")
 			} else if err != nil {
 				return fmt.Errorf(": %w", err)
 			}
-
 		// Are we inside an array and seeing next value (rather than end of array)?
-		case d.state() == '[' && tok != json.Delim(']'):
+		case d.insideArray(tok):
 			someSliceExist := false
-			for i := range d.vs {
-				v := d.vs[i][len(d.vs[i])-1]
-				if v.Kind() == reflect.Ptr {
-					v = v.Elem()
-				}
+			for i, dv := range d.vs {
+				v := followPtr(dv[len(dv)-1])
 				var f reflect.Value
 				if v.Kind() == reflect.Slice {
 					v.Set(reflect.Append(v, reflect.Zero(v.Type().Elem()))) // v = append(v, T).
 					f = v.Index(v.Len() - 1)
 					someSliceExist = true
 				}
-				d.vs[i] = append(d.vs[i], f)
+				d.vs[i] = append(dv, f)
 			}
 			if !someSliceExist {
 				return fmt.Errorf("slice doesn't exist in any of %v places to unmarshal", len(d.vs))
@@ -176,14 +213,12 @@ func (d *Decoder) decode() error {
 		switch tok := tok.(type) {
 		case string, json.Number, bool, nil:
 			// Value.
-
-			for i := range d.vs {
-				v := d.vs[i][len(d.vs[i])-1]
+			for _, dv := range d.vs {
+				v := dv[len(dv)-1]
 				if !v.IsValid() {
 					continue
 				}
-				err := unmarshalValue(tok, v)
-				if err != nil {
+				if err := unmarshalValue(tok, v); err != nil {
 					return fmt.Errorf(": %w", err)
 				}
 			}
@@ -191,14 +226,12 @@ func (d *Decoder) decode() error {
 
 		case json.Delim:
 			switch tok {
-			case '{':
+			case objectBeginToken:
 				// Start of object.
-
 				d.pushState(tok)
-
 				frontier := make([]reflect.Value, len(d.vs)) // Places to look for GraphQL fragments/embedded structs.
-				for i := range d.vs {
-					v := d.vs[i][len(d.vs[i])-1]
+				for i, dv := range d.vs {
+					v := dv[len(dv)-1]
 					frontier[i] = v
 					// TODO: Do this recursively or not? Add a test case if needed.
 					if v.Kind() == reflect.Ptr && v.IsNil() {
@@ -208,44 +241,40 @@ func (d *Decoder) decode() error {
 				// Find GraphQL fragments/embedded structs recursively, adding to frontier
 				// as new ones are discovered and exploring them further.
 				for len(frontier) > 0 {
-					v := frontier[0]
+					v := followPtr(frontier[0])
 					frontier = frontier[1:]
-					if v.Kind() == reflect.Ptr {
-						v = v.Elem()
-					}
 					if v.Kind() != reflect.Struct {
 						continue
 					}
 					for i := 0; i < v.NumField(); i++ {
-						if isGraphQLFragment(v.Type().Field(i)) || v.Type().Field(i).Anonymous {
+						tf := v.Type().Field(i)
+						if isGraphQLFragment(tf) || tf.Anonymous {
+							f := v.Field(i)
 							// Add GraphQL fragment or embedded struct.
-							d.vs = append(d.vs, []reflect.Value{v.Field(i)})
-							frontier = append(frontier, v.Field(i))
+							d.vs = append(d.vs, []reflect.Value{f})
+							frontier = append(frontier, f)
 						}
 					}
 				}
-			case '[':
+			case arrayBeginToken:
 				// Start of array.
 
 				d.pushState(tok)
 
-				for i := range d.vs {
-					v := d.vs[i][len(d.vs[i])-1]
+				for _, dv := range d.vs {
+					v := followPtr(dv[len(dv)-1])
 					// TODO: Confirm this is needed, write a test case.
 					// if v.Kind() == reflect.Ptr && v.IsNil() {
 					//	v.Set(reflect.New(v.Type().Elem())) // v = new(T).
 					//}
 
 					// Reset slice to empty (in case it had non-zero initial value).
-					if v.Kind() == reflect.Ptr {
-						v = v.Elem()
-					}
 					if v.Kind() != reflect.Slice {
 						continue
 					}
 					v.Set(reflect.MakeSlice(v.Type(), 0, 0)) // v = make(T, 0, 0).
 				}
-			case '}', ']':
+			case objectEndToken, arrayEndToken:
 				// End of object or array.
 				d.popAllVs()
 				d.popState()
@@ -273,20 +302,20 @@ func (d *Decoder) popState() {
 
 // state reports the parse state on top of stack, or 0 if empty.
 func (d *Decoder) state() json.Delim {
-	if len(d.parseState) == 0 {
+	if l := len(d.parseState); l == 0 {
 		return 0
+	} else {
+		return d.parseState[l-1]
 	}
-
-	return d.parseState[len(d.parseState)-1]
 }
 
 // popAllVs pops from all d.vs stacks, keeping only non-empty ones.
 func (d *Decoder) popAllVs() {
 	var nonEmpty [][]reflect.Value
-	for i := range d.vs {
-		d.vs[i] = d.vs[i][:len(d.vs[i])-1]
-		if len(d.vs[i]) > 0 {
-			nonEmpty = append(nonEmpty, d.vs[i])
+	for _, dv := range d.vs {
+		dv = dv[:len(dv)-1]
+		if len(dv) > 0 {
+			nonEmpty = append(nonEmpty, dv)
 		}
 	}
 	d.vs = nonEmpty
@@ -296,11 +325,12 @@ func (d *Decoder) popAllVs() {
 // that matches GraphQL name, or invalid reflect.Value if none found.
 func fieldByGraphQLName(v reflect.Value, name string) reflect.Value {
 	for i := 0; i < v.NumField(); i++ {
-		if v.Type().Field(i).PkgPath != "" {
+		f := v.Type().Field(i)
+		if f.PkgPath != "" {
 			// Skip unexported field.
 			continue
 		}
-		if hasGraphQLName(v.Type().Field(i), name) {
+		if hasGraphQLName(f, name) {
 			return v.Field(i)
 		}
 	}
